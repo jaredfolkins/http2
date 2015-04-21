@@ -409,7 +409,14 @@ func main() {
 
 	url := "https://" + *addr + "/"
 	log.Printf("Listening on " + url)
-	http2.ConfigureServer(&srv, &http2.Server{})
+
+	// example of passing configuration to server
+	cfg := &http2.Server{
+		MaxConcurrentStreams: 0, // 0 is unlimited
+		MaxHandlers:          0, // 0 is unlimited
+	}
+
+	http2.ConfigureServer(&srv, cfg)
 
 	if *httpAddr != "" {
 		go func() { log.Fatal(http.ListenAndServe(*httpAddr, nil)) }()

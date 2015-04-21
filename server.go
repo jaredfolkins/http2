@@ -63,6 +63,7 @@ const (
 	firstSettingsTimeout  = 2 * time.Second // should be in-flight with preface anyway
 	handlerChunkWriteSize = 4 << 10
 	defaultMaxStreams     = 250 // TODO: make this 100 as the GFE seems to?
+	defaultMaxHandlers    = 0
 )
 
 var (
@@ -126,6 +127,13 @@ func (s *Server) maxConcurrentStreams() uint32 {
 		return v
 	}
 	return defaultMaxStreams
+}
+
+func (s *Server) maxHandlers() int {
+	if v := s.MaxHandlers; v > 0 {
+		return v
+	}
+	return defaultMaxHandlers
 }
 
 // ConfigureServer adds HTTP/2 support to a net/http Server.
@@ -207,6 +215,7 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 		wroteFrameCh:     make(chan struct{}, 1), // buffered; one send in reading goroutine
 		bodyReadCh:       make(chan bodyReadMsg), // buffering doesn't matter either way
 		doneServing:      make(chan struct{}),
+		advMaxHandlers:   srv.maxHandlers(),
 		advMaxStreams:    srv.maxConcurrentStreams(),
 		writeSched: writeScheduler{
 			maxFrameSize: initialMaxFrameSize,
@@ -345,7 +354,9 @@ type serverConn struct {
 	pushEnabled           bool
 	sawFirstSettings      bool // got the initial SETTINGS frame after the preface
 	needToSendSettingsAck bool
-	unackedSettings       int    // how many SETTINGS have we sent without ACKs?
+	unackedSettings       int // how many SETTINGS have we sent without ACKs?
+	advMaxHandlers        int
+	curOpenHandlers       int
 	clientMaxStreams      uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
 	advMaxStreams         uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	curOpenStreams        uint32 // client's number of open streams
@@ -609,7 +620,6 @@ func (sc *serverConn) serve() {
 		write: writeSettings{
 			{SettingMaxFrameSize, sc.srv.maxReadFrameSize()},
 			{SettingMaxConcurrentStreams, sc.advMaxStreams},
-
 			// TODO: more actual settings, notably
 			// SettingInitialWindowSize, but then we also
 			// want to bump up the conn window size the
@@ -1265,6 +1275,7 @@ func (sc *serverConn) processHeaderBlockFragment(st *stream, frag []byte, end bo
 		// TODO: convert to stream error I assume?
 		return err
 	}
+
 	defer sc.resetPendingRequest()
 	if sc.curOpenStreams > sc.advMaxStreams {
 		// "Endpoints MUST NOT exceed the limit set by their
@@ -1285,12 +1296,21 @@ func (sc *serverConn) processHeaderBlockFragment(st *stream, frag []byte, end bo
 		return StreamError{st.id, ErrCodeRefusedStream}
 	}
 
+	// No limit when advMaxHandlers is 0 or negative.
+	if sc.advMaxHandlers > 0 && sc.curOpenHandlers > sc.advMaxHandlers {
+		// Requests are coming in too fast and will be refused.
+		// By passing ErroCodeRefusedStream the client can choose
+		// to retry request.
+		return StreamError{st.id, ErrCodeRefusedStream}
+	}
+
 	rw, req, err := sc.newWriterAndRequest()
 	if err != nil {
 		return err
 	}
 	st.body = req.Body.(*requestBody).pipe // may be nil
 	st.declBodyBytes = req.ContentLength
+	sc.curOpenHandlers++
 	go sc.runHandler(rw, req)
 	return nil
 }
@@ -1775,6 +1795,8 @@ func (w *responseWriter) handlerDone() {
 	}
 	rws.handlerDone = true
 	w.Flush()
+	rws.conn.curOpenHandlers--
+	rws.conn.vlogf("handlerDone() maxHandlers:%v openHandlers:%v", rws.conn.advMaxHandlers, rws.conn.curOpenHandlers)
 	w.rws = nil
 	responseWriterStatePool.Put(rws)
 }
